@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -194,9 +195,10 @@ def _backend_commands(mp3_path: Path, device: Optional[str], loops: int) -> Iter
         yield Cmd("__ffmpeg_aplay__", [str(mp3_path), device or "default", str(loops)])
 
     ffplay = _which("ffplay")
-    if ffplay:
+    if ffplay and not device:
         # ffplay output device selection is not portable; it uses the system default audio stack (SDL).
         # On headless systems this often fails with "audio open failed", so keep it as last resort.
+        # Also: if the user selected an ALSA device (or we auto-selected one), ffplay won't honor it.
         args = ["-nodisp", "-autoexit", "-loglevel", "error"]
         if loops < 0:
             args += ["-loop", "0"]
@@ -281,6 +283,12 @@ def main() -> int:
         action="store_true",
         help="Print the command that would be run, but do not play audio.",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "mpg123", "ffmpeg_aplay", "ffplay"],
+        default="auto",
+        help="Force a specific backend. Default: auto.",
+    )
 
     args = parser.parse_args()
 
@@ -292,11 +300,14 @@ def main() -> int:
     aplay_l = _aplay_list_cards()
     aplay_L = _aplay_list_pcms()
 
+    auto_dev_hint = _auto_select_alsa_device(aplay_l)
     if args.list_devices:
         print("=== aplay -l ===")
         print(aplay_l.strip() if aplay_l.strip() else "(aplay not found or no output)")
         print("\n=== aplay -L ===")
         print(aplay_L.strip() if aplay_L.strip() else "(aplay not found or no output)")
+        print("\n=== auto-select hint ===")
+        print(auto_dev_hint if auto_dev_hint else "(no obvious I2S/DAC device found)")
         return 0
 
     if _is_raspberry_pi():
@@ -304,13 +315,22 @@ def main() -> int:
             _print_i2s_setup_hint()
 
     device = args.device
-    if device is None:
-        auto_dev = _auto_select_alsa_device(aplay_l)
-        if auto_dev:
-            device = auto_dev
-            print(f"Auto-selected ALSA device: {device} (override with --device)")
+    if args.backend != "ffplay" and device is None and auto_dev_hint:
+        device = auto_dev_hint
+        print(f"Auto-selected ALSA device: {device} (override with --device)")
 
-    candidates = list(_backend_commands(mp3_path, device, args.loops))
+    if args.backend == "auto":
+        candidates = list(_backend_commands(mp3_path, device, args.loops))
+    elif args.backend == "mpg123":
+        candidates = list(_backend_commands(mp3_path, device, args.loops))
+        candidates = [c for c in candidates if Path(c.exe).name == "mpg123"]
+    elif args.backend == "ffmpeg_aplay":
+        candidates = list(_backend_commands(mp3_path, device, args.loops))
+        candidates = [c for c in candidates if c.exe == "__ffmpeg_aplay__"]
+    else:  # ffplay
+        candidates = list(_backend_commands(mp3_path, None, args.loops))
+        candidates = [c for c in candidates if Path(c.exe).name == "ffplay"]
+
     if not candidates:
         print(
             "No playback backend found. Install one of: mpg123, ffplay (ffmpeg), or ffmpeg+aplay.\n"
