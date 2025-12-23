@@ -4,8 +4,8 @@ PCM5100 (I2S) playback smoke test for Raspberry Pi 5.
 
 Plays an MP3 file via ALSA using whichever backend is available:
   1) mpg123 (preferred)
-  2) ffplay
-  3) ffmpeg -> wav -> aplay
+  2) ffmpeg -> wav -> aplay
+  3) ffplay (last resort; may fail on headless systems)
 
 Wiring reminder (PCM5100 to Pi):
   VIN/5V  -> Pin 02 (5V)
@@ -19,9 +19,7 @@ Wiring reminder (PCM5100 to Pi):
 from __future__ import annotations
 
 import argparse
-import os
 import platform
-import re
 import shlex
 import shutil
 import subprocess
@@ -106,6 +104,53 @@ def _guess_pcm5100_card_present(aplay_l: str, aplay_L: str) -> bool:
     return any(k in hay for k in keywords)
 
 
+def _auto_select_alsa_device(aplay_l: str) -> Optional[str]:
+    """
+    Best-effort: pick a likely I2S DAC card from `aplay -l` output.
+    Returns an ALSA device string like "plughw:1,0" or None.
+    """
+    if not aplay_l.strip():
+        return None
+
+    # Example line:
+    # card 1: sndrpihifiberry [snd_rpi_hifiberry_dac], device 0: ...
+    line_re = re.compile(r"^card\s+(?P<card>\d+):\s+(?P<name>.+?),\s+device\s+(?P<dev>\d+):", re.IGNORECASE)
+    preferred_keywords = [
+        "hifiberry",
+        "snd_rpi_hifiberry_dac",
+        "sndrpihifiberry",
+        "i2s",
+        "rpi-dac",
+        "rpidac",
+        "pcm51",
+        "dac",
+    ]
+
+    candidates: list[tuple[int, int, str]] = []
+    for raw in aplay_l.splitlines():
+        line = raw.strip()
+        m = line_re.match(line)
+        if not m:
+            continue
+        card = int(m.group("card"))
+        dev = int(m.group("dev"))
+        name = m.group("name").lower()
+        score = 0
+        for kw in preferred_keywords:
+            if kw in name:
+                score += 10
+        candidates.append((score, card, f"plughw:{card},{dev}"))
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    best_score, _, best_dev = candidates[0]
+    if best_score <= 0:
+        return None
+    return best_dev
+
+
 def _print_i2s_setup_hint() -> None:
     msg = """
 PCM5100/I2S card not detected in ALSA output.
@@ -140,18 +185,6 @@ def _backend_commands(mp3_path: Path, device: Optional[str], loops: int) -> Iter
         args += [str(mp3_path)]
         yield Cmd(mpg123, args)
 
-    ffplay = _which("ffplay")
-    if ffplay:
-        # ffplay default output device is system default; piping to ALSA device is not portable.
-        # Still useful if user has set default card to the I2S DAC.
-        args = ["-nodisp", "-autoexit", "-loglevel", "error"]
-        if loops < 0:
-            args += ["-loop", "0"]
-        elif loops > 1:
-            args += ["-loop", str(loops - 1)]
-        args += [str(mp3_path)]
-        yield Cmd(ffplay, args)
-
     ffmpeg = _which("ffmpeg")
     aplay = _which("aplay")
     if ffmpeg and aplay:
@@ -159,6 +192,18 @@ def _backend_commands(mp3_path: Path, device: Optional[str], loops: int) -> Iter
         # (PCM5100 is 16/24-bit capable; we'll keep it simple: 44100Hz stereo 16-bit)
         # Note: ffmpeg supports "-f wav -" piping, but aplay device selection + stdin is flaky across distros.
         yield Cmd("__ffmpeg_aplay__", [str(mp3_path), device or "default", str(loops)])
+
+    ffplay = _which("ffplay")
+    if ffplay:
+        # ffplay output device selection is not portable; it uses the system default audio stack (SDL).
+        # On headless systems this often fails with "audio open failed", so keep it as last resort.
+        args = ["-nodisp", "-autoexit", "-loglevel", "error"]
+        if loops < 0:
+            args += ["-loop", "0"]
+        elif loops > 1:
+            args += ["-loop", str(loops - 1)]
+        args += [str(mp3_path)]
+        yield Cmd(ffplay, args)
 
 
 def _run_ffmpeg_to_wav_then_aplay(mp3_path: Path, device: str, loops: int) -> int:
@@ -258,7 +303,14 @@ def main() -> int:
         if not _guess_pcm5100_card_present(aplay_l, aplay_L):
             _print_i2s_setup_hint()
 
-    candidates = list(_backend_commands(mp3_path, args.device, args.loops))
+    device = args.device
+    if device is None:
+        auto_dev = _auto_select_alsa_device(aplay_l)
+        if auto_dev:
+            device = auto_dev
+            print(f"Auto-selected ALSA device: {device} (override with --device)")
+
+    candidates = list(_backend_commands(mp3_path, device, args.loops))
     if not candidates:
         print(
             "No playback backend found. Install one of: mpg123, ffplay (ffmpeg), or ffmpeg+aplay.\n"
@@ -293,6 +345,13 @@ def main() -> int:
         if p.returncode == 0:
             return 0
 
+        if Path(cmd.exe).name == "ffplay":
+            print(
+                "ffplay failed. On many headless Pi setups, ffplay/SDL can't open an audio device.\n"
+                "Fix: install mpg123 or ffmpeg+alsa-utils and re-run (preferably with --device plughw:<card>,<dev>).\n"
+                "Also verify your I2S DAC appears in `aplay -l`.",
+                file=sys.stderr,
+            )
         print(f"Backend failed with exit code {p.returncode}; trying next option...", file=sys.stderr)
 
     print("All playback backends failed.", file=sys.stderr)
