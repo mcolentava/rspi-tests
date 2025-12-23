@@ -64,6 +64,23 @@ def _read_text_if_exists(p: Path) -> Optional[str]:
         return None
 
 
+def _maybe_run(cmd: list[str]) -> tuple[int, str]:
+    """
+    Run a command and capture stdout+stderr. Never raises.
+    """
+    try:
+        p = subprocess.run(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        return p.returncode, p.stdout
+    except FileNotFoundError:
+        return 127, f"(not found: {cmd[0]})\n"
+
+
 def _is_raspberry_pi() -> bool:
     # Best-effort checks (works on Pi OS / Debian variants)
     model = _read_text_if_exists(Path("/proc/device-tree/model"))
@@ -289,6 +306,11 @@ def main() -> int:
         default="auto",
         help="Force a specific backend. Default: auto.",
     )
+    parser.add_argument(
+        "--diag",
+        action="store_true",
+        help="Print diagnostics (ALSA cards/devices, overlays hints) and exit.",
+    )
 
     args = parser.parse_args()
 
@@ -301,6 +323,55 @@ def main() -> int:
     aplay_L = _aplay_list_pcms()
 
     auto_dev_hint = _auto_select_alsa_device(aplay_l)
+
+    if args.diag:
+        print("=== system ===")
+        model = _read_text_if_exists(Path("/proc/device-tree/model")) or _read_text_if_exists(
+            Path("/sys/firmware/devicetree/base/model")
+        )
+        print(f"model: {model or '(unknown)'}")
+        print(f"machine: {platform.machine()}")
+        rc, out = _maybe_run(["uname", "-a"])
+        print(out.strip() if out.strip() else "(uname produced no output)")
+
+        print("\n=== aplay -l ===")
+        print(aplay_l.strip() if aplay_l.strip() else "(aplay not found or no output)")
+        print("\n=== aplay -L ===")
+        print(aplay_L.strip() if aplay_L.strip() else "(aplay not found or no output)")
+        print("\n=== auto-select hint ===")
+        print(auto_dev_hint if auto_dev_hint else "(no obvious I2S/DAC device found)")
+
+        print("\n=== boot config overlay hints ===")
+        cfg = Path("/boot/firmware/config.txt")
+        cfg_txt = _read_text_if_exists(cfg)
+        if cfg_txt is None:
+            print("(cannot read /boot/firmware/config.txt on this system)")
+        else:
+            interesting = [
+                ln
+                for ln in cfg_txt.splitlines()
+                if re.search(r"\b(dtparam=i2s|dtoverlay=|audio|hdmi|vc4)\b", ln, flags=re.IGNORECASE)
+            ]
+            print("\n".join(interesting).strip() if interesting else "(no matching lines found)")
+
+        print("\n=== dtoverlay -l ===")
+        rc, out = _maybe_run(["dtoverlay", "-l"])
+        print(out.strip() if out.strip() else "(dtoverlay not found or no output)")
+
+        print("\n=== dmesg (filtered) ===")
+        rc, out = _maybe_run(["dmesg"])
+        if rc == 0 and out:
+            lines = []
+            for ln in out.splitlines():
+                if re.search(r"(i2s|hifiberry|asoc|snd|pcm|alsa)", ln, flags=re.IGNORECASE):
+                    lines.append(ln)
+            print("\n".join(lines[-120:]).strip() if lines else "(no relevant dmesg lines found)")
+        else:
+            print(out.strip() if out.strip() else "(dmesg not available)")
+
+        print("\n=== speaker-test availability ===")
+        print(_which("speaker-test") or "(speaker-test not found; install alsa-utils)")
+        return 0
     if args.list_devices:
         print("=== aplay -l ===")
         print(aplay_l.strip() if aplay_l.strip() else "(aplay not found or no output)")
